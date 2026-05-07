@@ -277,6 +277,14 @@ func (sp *ServerPeer) OnInv(p *peer.Peer, msg *wire.MsgInv) {
 	newInv := wire.NewMsgInvSizeHint(uint(len(msg.InvList)))
 	for _, invVect := range msg.InvList {
 		if invVect.Type == wire.InvTypeTx {
+			// When mempool tracking is enabled, allow transaction
+			// inventory announcements to pass through silently.
+			// The raw inv is delivered to SubscribeRecvMsg
+			// subscribers via OnRead, which is how callers can
+			// observe and react to mempool activity.
+			if sp.server.mempoolEnabled {
+				continue
+			}
 			log.Tracef("Ignoring tx %s in inv from %v -- "+
 				"SPV mode", invVect.Hash, sp)
 			if sp.ProtocolVersion() >= wire.BIP0037Version {
@@ -626,6 +634,20 @@ type Config struct {
 	//    not, replies with a getdata message.
 	// 3. Neutrino sends the raw transaction.
 	BroadcastTimeout time.Duration
+
+	// MempoolEnabled, when set, instructs the chain service to accept
+	// transaction inventory announcements from peers instead of treating
+	// them as a protocol violation and disconnecting. The corresponding
+	// peer.Config.DisableRelayTx is also flipped to false so peers will
+	// actually relay transaction invs to us.
+	//
+	// This does NOT cause neutrino to track or fetch any transactions on
+	// its own; consumers must register their own logic via
+	// SubscribeRecvMsg / ConnectedPeers and issue getdata requests
+	// themselves. It exists purely to relax the SPV-mode disconnect
+	// behaviour for callers that want to do mempool tracking on top of
+	// neutrino without forking the library further.
+	MempoolEnabled bool
 }
 
 // HeadersImportConfig contains configuration options for importing headers
@@ -729,6 +751,12 @@ type ChainService struct { // nolint:maligned
 	dialer       func(net.Addr) (net.Conn, error)
 
 	broadcastTimeout time.Duration
+
+	// mempoolEnabled mirrors Config.MempoolEnabled. When true, OnInv will
+	// not disconnect peers that announce transactions and the per-peer
+	// peer.Config will request tx relay (DisableRelayTx=false), allowing
+	// callers to observe mempool inv/tx traffic via SubscribeRecvMsg.
+	mempoolEnabled bool
 }
 
 // NewChainService returns a new chain service configured to connect to the
@@ -789,6 +817,7 @@ func NewChainService(cfg Config) (*ChainService, error) {
 		persistToDisk:     cfg.PersistToDisk,
 		broadcastTimeout:  cfg.BroadcastTimeout,
 		headersImport:     cfg.HeadersImport,
+		mempoolEnabled:    cfg.MempoolEnabled,
 	}
 	s.workManager = query.NewWorkManager(&query.Config{
 		ConnectedPeers: s.ConnectedPeers,
@@ -1565,7 +1594,7 @@ func NewPeerConfig(sp *ServerPeer) *peer.Config {
 		ChainParams:      &sp.server.chainParams,
 		Services:         sp.server.services,
 		ProtocolVersion:  wire.AddrV2Version,
-		DisableRelayTx:   true,
+		DisableRelayTx:   !sp.server.mempoolEnabled,
 	}
 }
 
